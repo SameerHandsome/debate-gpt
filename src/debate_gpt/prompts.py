@@ -1,12 +1,18 @@
 """Prompt builders for the three agents.
 
-Each builder returns a list[BaseMessage] suitable for `BaseChatModel.invoke`.
+Each builder returns a list[BaseMessage] suitable for `BaseChatModel.invoke`,
+except for `build_judge_messages` which returns a `JudgePromptBundle` exposing
+the `pro_label` / `con_label` mapping for the bias-mitigation invariant
+(PRD §3.4).
+
 Pro and Con enforce a ~200-word target via the system prompt. The Judge
 prompt labels arguments as "Speaker A" / "Speaker B" — never "Pro" / "Con" —
-per the bias-mitigation rule in PRD §3.4.
+so position-label bias is not encoded in the judge's view.
 """
 
 from __future__ import annotations
+
+from typing import NamedTuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -100,9 +106,22 @@ Return a JSON object with EXACTLY these fields and NOTHING else \
 }"""
 
 
+class JudgePromptBundle(NamedTuple):
+    """The judge's prompt plus the label mapping for the bias-mitigation rule.
+
+    The judge node derives the verdict translation from the `swap` boolean
+    (single source of truth). `pro_label` / `con_label` are exposed for
+    logging and to keep the prompt construction in one place.
+    """
+
+    messages: list
+    pro_label: str  # "Speaker A" or "Speaker B"
+    con_label: str  # the opposite
+
+
 def build_judge_messages(
     state: DebateState, pro_text: str, con_text: str, swap: bool
-) -> list:
+) -> JudgePromptBundle:
     """Build the judge prompt.
 
     `swap=True` inverts which argument is labeled Speaker A — the bias
@@ -123,7 +142,11 @@ def build_judge_messages(
         f"--- Speaker B ---\n{speaker_b_text}\n\n"
         "Return your JSON scorecard."
     )
-    return [
-        SystemMessage(content=JUDGE_SYSTEM),
-        HumanMessage(content=user_payload),
-    ]
+    return JudgePromptBundle(
+        messages=[
+            SystemMessage(content=JUDGE_SYSTEM),
+            HumanMessage(content=user_payload),
+        ],
+        pro_label=pro_label,
+        con_label=con_label,
+    )
