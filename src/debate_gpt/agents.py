@@ -16,9 +16,11 @@ import logging
 import re
 from typing import Any, Callable
 
-from langchain_core.messages import AIMessage
+from langchain_core.exceptions import OutputParserException
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
+from pydantic import ValidationError
 
 from .config import load_settings
 from .prompts import build_con_messages, build_judge_messages, build_pro_messages
@@ -94,16 +96,27 @@ def make_judge_node(llm) -> NodeFn:
             )
 
         swap = state["round"] % 2 == 0
-        messages = build_judge_messages(state, pro_text, con_text, swap=swap)
-        response = llm.invoke(messages)
-        raw = _extract_content(response)
+        bundle = build_judge_messages(state, pro_text, con_text, swap=swap)
+        score_dict = _invoke_judge_with_retry(llm, bundle.messages, max_retries=2)
 
-        score_dict = _parse_judge_output(raw)
+        # On a successful parse, translate the Speaker A/B verdict back to
+        # pro/con and compute the derived totals for the verdict node (Day 3).
+        if "round_winner" in score_dict and "parse_error" not in score_dict:
+            score_dict["round_winner"] = _translate_winner(
+                score_dict["round_winner"], swap
+            )
+            score_dict["pro_score"] = _pro_total(score_dict, swap)
+            score_dict["con_score"] = _con_total(score_dict, swap)
+
         next_round = state["round"] + 1
-
         logger.info(
-            "judge round=%d swap=%s winner=%s next_round=%d",
-            state["round"], swap, score_dict.get("round_winner"), next_round,
+            "judge round=%d swap=%s winner=%s pro=%s con=%s next_round=%d",
+            state["round"],
+            swap,
+            score_dict.get("round_winner"),
+            score_dict.get("pro_score"),
+            score_dict.get("con_score"),
+            next_round,
         )
         return {
             "round_scores": [score_dict],
@@ -141,42 +154,129 @@ def _latest_text(messages: list, name: str) -> str | None:
 
 
 _JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+_STRUCTURED_UNSUPPORTED = (NotImplementedError, AttributeError, ValueError)
+
+# Concise feedback injected on retry. The model sees its own mistake and
+# a terse instruction to return ONLY the JSON object.
+_RETRY_FEEDBACK_TMPL = (
+    "Your previous output failed validation: {err}\n"
+    "Return ONLY the JSON object exactly matching the schema above. "
+    "No markdown fences, no commentary, no trailing prose."
+)
 
 
-def _parse_judge_output(raw: str) -> dict:
-    """Best-effort parse of the judge's JSON output.
+def _invoke_judge_with_retry(llm, messages: list, max_retries: int = 2) -> dict:
+    """Invoke the judge and return a RoundScore dict.
 
-    Day 1: try strict JSON first, then strip code fences, then keep the raw
-    string under `{"raw": ...}` so the CLI never crashes on a malformed
-    response. Day 2 adds Pydantic range validation + retry.
+    Strategy:
+      1) Try `llm.with_structured_output(RoundScore)` once (tool-calling path).
+         If the provider doesn't support it, or the model emits malformed
+         tool args, fall through to path 2.
+      2) Manual parse: invoke plain LLM, extract the first {...} blob,
+         validate with RoundScore. On any failure, append a feedback
+         HumanMessage and re-invoke, up to `max_retries` additional times.
+
+    Always returns a dict. On full failure, returns
+    `{"raw": ..., "parse_error": "..."}` so the graph keeps running.
     """
-    text = raw.strip()
-    # Strip ```json ... ``` fences if the model wraps its output.
-    text = _JSON_FENCE.sub("", text).strip()
-
+    # --- Path 1: structured output (tool calling) ---
     try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            # Best-effort schema check; tolerate extra keys, require the
-            # 8 documented ones. Day 2 tightens this with RoundScore.
-            expected = {
-                "speaker_a_logic", "speaker_a_evidence", "speaker_a_persuasion",
-                "speaker_b_logic", "speaker_b_evidence", "speaker_b_persuasion",
-                "round_winner", "reasoning",
-            }
-            missing = expected - parsed.keys()
-            if missing:
-                logger.warning("judge JSON missing fields %s; storing raw", missing)
-                return {"raw": raw, "parse_error": f"missing fields: {sorted(missing)}"}
-            # Try full Pydantic validate for type/range safety.
-            try:
-                RoundScore.model_validate(parsed)
-            except Exception as exc:
-                logger.warning("RoundScore validation failed: %s", exc)
-                return {"raw": raw, "parse_error": str(exc)}
-            return parsed
-        logger.warning("judge JSON was not an object; storing raw")
-        return {"raw": raw, "parse_error": "not a JSON object"}
-    except json.JSONDecodeError as exc:
-        logger.warning("judge JSON decode failed: %s; storing raw", exc)
-        return {"raw": raw, "parse_error": str(exc)}
+        structured = llm.with_structured_output(RoundScore)
+        result = structured.invoke(messages)
+        if isinstance(result, RoundScore):
+            return result.model_dump()
+        # Some adapters return a dict already.
+        return RoundScore.model_validate(result).model_dump()
+    except _STRUCTURED_UNSUPPORTED as exc:
+        logger.info(
+            "structured_output unsupported (%s); falling back to manual parse", exc
+        )
+    except (ValidationError, OutputParserException, json.JSONDecodeError) as exc:
+        logger.warning(
+            "structured_output validation failed: %s; falling back to manual parse",
+            exc,
+        )
+
+    # --- Path 2: manual parse with retry ---
+    convo = list(messages)  # copy; we may append feedback
+    last_err: str | None = None
+    last_raw: str | None = None
+    for attempt in range(max_retries + 1):  # initial + max_retries retries
+        response = llm.invoke(convo)
+        raw = _extract_content(response)
+        last_raw = raw
+        try:
+            return _parse_judge_output_strict(raw)
+        except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+            last_err = str(exc)
+            logger.warning(
+                "judge parse attempt %d/%d failed: %s",
+                attempt + 1,
+                max_retries + 1,
+                exc,
+            )
+            if attempt < max_retries:
+                convo = convo + [
+                    HumanMessage(content=_RETRY_FEEDBACK_TMPL.format(err=last_err))
+                ]
+
+    return {"raw": last_raw or "", "parse_error": last_err or "unknown parse failure"}
+
+
+def _parse_judge_output_strict(raw: str) -> dict:
+    """Strict parse: extract the first JSON object, validate with RoundScore.
+
+    Raises on failure (the retry helper owns the fallback decision).
+    """
+    text = _JSON_FENCE.sub("", raw.strip()).strip()
+    match = _JSON_OBJECT_RE.search(text)
+    if not match:
+        raise ValueError("no JSON object found in judge output")
+    parsed = json.loads(match.group(0))
+    if not isinstance(parsed, dict):
+        raise ValueError("judge JSON is not an object")
+    return RoundScore.model_validate(parsed).model_dump()
+
+
+def _translate_winner(winner: str, swap: bool) -> str:
+    """Translate Speaker A/B verdict back to pro/con/tie.
+
+    swap=True (even rounds): Con was Speaker A, Pro was Speaker B.
+    swap=False (odd rounds): Pro was Speaker A, Con was Speaker B.
+    """
+    if winner == "tie":
+        return "tie"
+    if swap:
+        # Con = A, Pro = B
+        return "con" if winner == "A" else "pro"
+    # Pro = A, Con = B
+    return "pro" if winner == "A" else "con"
+
+
+def _pro_total(score: dict, swap: bool) -> int:
+    if swap:  # Pro was Speaker B
+        return (
+            score["speaker_b_logic"]
+            + score["speaker_b_evidence"]
+            + score["speaker_b_persuasion"]
+        )
+    return (
+        score["speaker_a_logic"]
+        + score["speaker_a_evidence"]
+        + score["speaker_a_persuasion"]
+    )
+
+
+def _con_total(score: dict, swap: bool) -> int:
+    if swap:  # Con was Speaker A
+        return (
+            score["speaker_a_logic"]
+            + score["speaker_a_evidence"]
+            + score["speaker_a_persuasion"]
+        )
+    return (
+        score["speaker_b_logic"]
+        + score["speaker_b_evidence"]
+        + score["speaker_b_persuasion"]
+    )
