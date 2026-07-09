@@ -4,3 +4,11 @@ __pycache__/
 .env
 node_modules/
 .env.local
+
+# Day 3: runtime artifacts
+logs/
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

@@ -13,9 +13,11 @@ returning 2, 3, 4; the fourth call exits.
 
 from __future__ import annotations
 
+from typing import Any
+
 from langgraph.graph import END, START, StateGraph
 
-from .agents import build_llms, make_con_node, make_judge_node, make_pro_node
+from .agents import ChunkSink, build_llms, make_con_node, make_judge_node, make_pro_node
 from .state import DebateState
 
 
@@ -26,12 +28,29 @@ def should_continue(state: DebateState) -> str:
     return END
 
 
-def build_graph():
-    llms = build_llms()
+def build_graph(
+    llms: dict[str, Any] | None = None,
+    chunk_sink: ChunkSink | None = None,
+):
+    """Compile the debate graph.
+
+    Parameters
+    ----------
+    llms : dict, optional
+        Override the real LLM clients. Day 5's pytest suite (and
+        `dry_run.py`) inject a `FakeLLM` here.
+    chunk_sink : callable, optional
+        `(event, round, content) -> None` invoked as pro/con tokens
+        stream. Day 3's runtime passes a sink that XADDs each chunk to
+        the session's Upstash Stream.
+    """
+    if llms is None:
+        llms = build_llms()
+
     g = StateGraph(DebateState)
 
-    g.add_node("pro_node", make_pro_node(llms["pro"]))
-    g.add_node("con_node", make_con_node(llms["con"]))
+    g.add_node("pro_node", make_pro_node(llms["pro"], chunk_sink=chunk_sink))
+    g.add_node("con_node", make_con_node(llms["con"], chunk_sink=chunk_sink))
     g.add_node("judge_node", make_judge_node(llms["judge"]))
 
     g.add_edge(START, "pro_node")

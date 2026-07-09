@@ -26,8 +26,16 @@ from .config import load_settings
 from .prompts import build_con_messages, build_judge_messages, build_pro_messages
 from .schemas import RoundScore
 from .state import DebateState
+from .verdict import con_total_for_round, pro_total_for_round
 
 logger = logging.getLogger(__name__)
+
+
+# Signature of the streaming sink the runtime passes in. Receives the
+# caller-supplied event name (e.g. "pro_token"), the round number, and the
+# newly-flushed content chunk. Called from inside a sync thread; must not
+# raise. Used by Day 3 SSE.
+ChunkSink = Callable[[str, int, str], None]
 
 
 # ---------- LLM clients ----------
@@ -62,23 +70,81 @@ def build_llms() -> dict[str, Any]:
 
 NodeFn = Callable[[DebateState], dict]
 
+# How many characters of streaming buffer to flush per chunk. Smaller =
+# more events; larger = fewer round-trips. ~50 chars is a good balance
+# for human-readable token flow.
+_CHUNK_FLUSH_CHARS = 50
 
-def make_pro_node(llm) -> NodeFn:
+
+def _stream_and_collect(
+    llm,
+    messages: list,
+    event_name: str,
+    round_no: int,
+    chunk_sink: ChunkSink | None,
+) -> str:
+    """Run `llm.stream(messages)`; flush incremental chunks to `chunk_sink`
+    and return the joined final content.
+
+    Each flush sends the *new* text accumulated since the last flush
+    (e.g. ~50 chars at a time). The sink is called with
+    (event_name, round_no, content). Final-flush is always called so the
+    last partial buffer is never lost.
+
+    If `chunk_sink` is None (e.g. dry-run, pytest), no flushes happen —
+    the function still returns the full content for state accumulation.
+    """
+    full: list[str] = []
+    pending: list[str] = []  # unflushed accumulator
+    pending_len = 0
+    for chunk in llm.stream(messages):
+        text = _extract_content(chunk) if chunk is not None else ""
+        if not text:
+            continue
+        full.append(text)
+        if chunk_sink is not None:
+            pending.append(text)
+            pending_len += len(text)
+            if pending_len >= _CHUNK_FLUSH_CHARS:
+                chunk_sink(event_name, round_no, "".join(pending))
+                pending = []
+                pending_len = 0
+
+    final = "".join(full)
+    if chunk_sink is not None and pending:
+        # Final flush so nothing is dropped.
+        chunk_sink(event_name, round_no, "".join(pending))
+    return final
+
+
+def make_pro_node(llm, chunk_sink: ChunkSink | None = None) -> NodeFn:
     def pro_node(state: DebateState) -> dict:
         messages = build_pro_messages(state)
-        response = llm.invoke(messages)
-        content = _extract_content(response)
+        # Use the streaming path only when a sink is attached; otherwise
+        # call invoke() so dry-run / pytests don't pay the streaming cost.
+        if chunk_sink is None:
+            response = llm.invoke(messages)
+            content = _extract_content(response)
+        else:
+            content = _stream_and_collect(
+                llm, messages, "pro_token", state["round"], chunk_sink
+            )
         logger.info("pro round=%d chars=%d", state["round"], len(content))
         return {"messages": [AIMessage(content=content, name="Pro")]}
 
     return pro_node
 
 
-def make_con_node(llm) -> NodeFn:
+def make_con_node(llm, chunk_sink: ChunkSink | None = None) -> NodeFn:
     def con_node(state: DebateState) -> dict:
         messages = build_con_messages(state)
-        response = llm.invoke(messages)
-        content = _extract_content(response)
+        if chunk_sink is None:
+            response = llm.invoke(messages)
+            content = _extract_content(response)
+        else:
+            content = _stream_and_collect(
+                llm, messages, "con_token", state["round"], chunk_sink
+            )
         logger.info("con round=%d chars=%d", state["round"], len(content))
         return {"messages": [AIMessage(content=content, name="Con")]}
 
@@ -105,8 +171,8 @@ def make_judge_node(llm) -> NodeFn:
             score_dict["round_winner"] = _translate_winner(
                 score_dict["round_winner"], swap
             )
-            score_dict["pro_score"] = _pro_total(score_dict, swap)
-            score_dict["con_score"] = _con_total(score_dict, swap)
+            score_dict["pro_score"] = pro_total_for_round(score_dict, swap)
+            score_dict["con_score"] = con_total_for_round(score_dict, swap)
 
         next_round = state["round"] + 1
         logger.info(
@@ -252,31 +318,3 @@ def _translate_winner(winner: str, swap: bool) -> str:
         return "con" if winner == "A" else "pro"
     # Pro = A, Con = B
     return "pro" if winner == "A" else "con"
-
-
-def _pro_total(score: dict, swap: bool) -> int:
-    if swap:  # Pro was Speaker B
-        return (
-            score["speaker_b_logic"]
-            + score["speaker_b_evidence"]
-            + score["speaker_b_persuasion"]
-        )
-    return (
-        score["speaker_a_logic"]
-        + score["speaker_a_evidence"]
-        + score["speaker_a_persuasion"]
-    )
-
-
-def _con_total(score: dict, swap: bool) -> int:
-    if swap:  # Con was Speaker A
-        return (
-            score["speaker_a_logic"]
-            + score["speaker_a_evidence"]
-            + score["speaker_a_persuasion"]
-        )
-    return (
-        score["speaker_b_logic"]
-        + score["speaker_b_evidence"]
-        + score["speaker_b_persuasion"]
-    )

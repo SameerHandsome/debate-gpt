@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "debate-gpt"
+version = "0.1.0"
+description = "Multi-agent AI debate platform"
+requires-python = ">=3.11"
+# Runtime deps are tracked in requirements.txt at the repo root.
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"debate_gpt" = ["py.typed"]
