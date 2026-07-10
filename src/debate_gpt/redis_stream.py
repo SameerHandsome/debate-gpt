@@ -1,7 +1,9 @@
 """Sync Upstash Redis REST client.
 
-Upstash's REST API supports Redis Stream commands (`XADD`, `XRANGE`,
-`XLEN`, `DEL`) over plain HTTPS POSTs. We use `httpx.Client` once per
+Upstash's REST API accepts a whole Redis command as a single JSON array
+posted to the base URL: ["XADD", "mykey", "*", "field1", "value1", ...].
+The first element is the command name, and the rest are its arguments
+in the same order as the Redis protocol. We use `httpx.Client` once per
 process and re-use it across calls.
 
 Used by:
@@ -18,12 +20,12 @@ XADD fields (per PRD §5.2):
     }
 
 Upstash returns stream entry ids of the form `<ms-timestamp>-<seq>`.
-`xrange(stream, since_id="(<id>")` returns entries strictly greater than
-the given id; `-` is the start of the stream.
+XRANGE requires both a start and end id; "-" is the start of the stream
+and "+" is the end. An exclusive start like "(<id>" returns only entries
+strictly greater than that id (Redis 6.2+ syntax).
 """
 from __future__ import annotations
 
-import json
 import os
 import threading
 from typing import Any
@@ -61,10 +63,15 @@ def _auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def _post(command_path: str) -> dict[str, Any]:
+def _command(*parts: Any) -> Any:
+    """Send a single Redis command as a JSON array to the base REST URL.
+
+    Returns the parsed JSON response, e.g. {"result": ...} or {"error": ...}.
+    """
     r = _get_client().post(
-        f"{_url()}/{command_path}",
+        _url(),
         headers=_auth_headers(),
+        json=list(parts),
         timeout=_TIMEOUT_SECONDS,
     )
     r.raise_for_status()
@@ -74,72 +81,55 @@ def _post(command_path: str) -> dict[str, Any]:
 # ---------- Public API ----------
 
 def xadd(session_id: str, fields: dict[str, str]) -> str:
-    """Append one entry to the session stream; return the new entry id.
-
-    Upstash XADD payload: an array of `{id, fields}` objects; `id: "*"`
-    tells the server to generate one.
-    """
-    body = [{"id": "*", "fields": {k: str(v) for k, v in fields.items()}}]
-    r = _get_client().post(
-        f"{_url()}/xadd/{_stream_prefix}{session_id}",
-        headers=_auth_headers(),
-        json=body,
-        timeout=_TIMEOUT_SECONDS,
-    )
-    r.raise_for_status()
-    return r.json()["result"]
+    """Append one entry to the session stream; return the new entry id."""
+    key = f"{_STREAM_PREFIX}{session_id}"
+    args: list[Any] = ["XADD", key, "*"]
+    for k, v in fields.items():
+        args.append(k)
+        args.append(str(v))
+    result = _command(*args)
+    return result["result"]
 
 
 def xrange(session_id: str, since_id: str = "-") -> list[dict[str, Any]]:
-    """Return entries with id > `since_id`.
+    """Return entries with id > `since_id`, up to the end of the stream.
 
     Each entry is a dict: `{"id": "1700…-0", "fields": {"event": …, ...}}`.
     Empty list if the stream doesn't exist or no new entries.
     """
-    r = _get_client().post(
-        f"{_url()}/xrange/{_stream_prefix}{session_id}/{since_id}",
-        headers=_auth_headers(),
-        timeout=_TIMEOUT_SECONDS,
-    )
-    r.raise_for_status()
-    raw = r.json().get("result") or []
-    return [{"id": entry[0], "fields": entry[1]} for entry in raw]
+    key = f"{_STREAM_PREFIX}{session_id}"
+    result = _command("XRANGE", key, since_id, "+")
+    raw = result.get("result") or []
+    entries: list[dict[str, Any]] = []
+    for entry in raw:
+        entry_id = entry[0]
+        flat_fields = entry[1]  # [field1, value1, field2, value2, ...]
+        fields = dict(zip(flat_fields[0::2], flat_fields[1::2]))
+        entries.append({"id": entry_id, "fields": fields})
+    return entries
 
 
 def xlen(session_id: str) -> int:
     """Return the number of entries in the stream (0 if absent)."""
-    r = _get_client().post(
-        f"{_url()}/xlen/{_stream_prefix}{session_id}",
-        headers=_auth_headers(),
-        timeout=_TIMEOUT_SECONDS,
-    )
-    r.raise_for_status()
-    return r.json().get("result") or 0
+    key = f"{_STREAM_PREFIX}{session_id}"
+    result = _command("XLEN", key)
+    return result.get("result") or 0
 
 
 def delete_key(session_id: str) -> None:
     """Delete the stream key. Idempotent — no error if missing."""
-    r = _get_client().post(
-        f"{_url()}/del/{_stream_prefix}{session_id}",
-        headers=_auth_headers(),
-        timeout=_TIMEOUT_SECONDS,
-    )
-    r.raise_for_status()
+    key = f"{_STREAM_PREFIX}{session_id}"
+    _command("DEL", key)
 
 
 def ping() -> bool:
-    """PING the server. Returns True on `+PONG`, False on any error.
+    """PING the server. Returns True on `PONG`, False on any error.
 
     Used by the /health endpoint.
     """
     try:
-        r = _get_client().post(
-            f"{_url()}/ping",
-            headers=_auth_headers(),
-            timeout=_TIMEOUT_SECONDS,
-        )
-        r.raise_for_status()
-        return r.json().get("result") == "PONG"
+        result = _command("PING")
+        return result.get("result") == "PONG"
     except Exception:
         return False
 

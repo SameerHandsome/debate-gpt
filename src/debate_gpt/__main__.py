@@ -13,7 +13,8 @@ from pathlib import Path
 _SRC = Path(__file__).resolve().parent.parent
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
-
+from dotenv import load_dotenv  # noqa: E402
+load_dotenv()
 import uvicorn  # noqa: E402
 
 

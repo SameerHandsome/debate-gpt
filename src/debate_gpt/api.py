@@ -20,11 +20,11 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 from pydantic import BaseModel, Field
 
 from . import db, redis_stream
@@ -41,6 +41,21 @@ from .runtime import run_debate_streaming
 # Configure logging at import time so the very first log line is shaped
 # correctly (FastAPI logs from uvicorn get intercepted here).
 configure_logging()
+
+
+# ---------- Response helper ----------
+
+class DateTimeJSONResponse(JSONResponse):
+    """JSONResponse that serializes datetime (and other non-JSON-native)
+    values via `str()`, mirroring `json.dumps(..., default=str)`.
+
+    Plain `JSONResponse` does not accept a `default=` kwarg — passing one
+    raises `TypeError: JSONResponse.__init__() got an unexpected keyword
+    argument 'default'`. This subclass overrides `render()` instead.
+    """
+
+    def render(self, content: Any) -> bytes:
+        return json.dumps(content, default=str).encode("utf-8")
 
 
 # ---------- Request / response models ----------
@@ -210,7 +225,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=503, detail="database unavailable") from exc
         if row is None:
             raise HTTPException(status_code=404, detail="debate not found")
-        return JSONResponse(content=row, default=str)
+        return DateTimeJSONResponse(content=row)
 
     # ---------- GET /debates ----------
 
@@ -224,7 +239,7 @@ def create_app() -> FastAPI:
         except Exception as exc:  # noqa: BLE001
             logger.error("list_debates: db error: {}", exc)
             raise HTTPException(status_code=503, detail="database unavailable") from exc
-        return JSONResponse(content=payload, default=str)
+        return DateTimeJSONResponse(content=payload)
 
     # ---------- DELETE /debate/{id} ----------
 
