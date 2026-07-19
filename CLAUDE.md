@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Multi-agent AI debate platform. Two LLM agents argue opposing sides of a user-supplied topic, a third (more powerful) model scores each round as an impartial judge, and a final verdict is declared. The full PRD lives in `PRD.md` — read it before changing architecture.
 
-Current state: **Day 3 complete** (FastAPI + SSE + Neon Postgres + Upstash Redis Streams + observability foundations). Days 4–7 (React frontend, pytest suite, eval suite, deploy) are the upcoming work.
+Current state: **Day 4 in progress** (FastAPI + SSE + Neon Postgres + Upstash Redis Streams + observability foundations done; React frontend scaffolding landed under `frontend/`, end-to-end manual smoke test in `tests/manual_day4.md`). Days 5–7 (pytest suite, eval suite, deploy) are the upcoming work.
 
 ## Common Commands
 
@@ -30,9 +30,15 @@ python dry_run.py
 python run_api.py
 python run_api.py --port 9000 --reload
 # Equivalent: python -m debate_gpt api --port 8000
+
+# Frontend (Day 4) — run from frontend/ with venv active on the backend
+cd frontend
+npm install
+npm run dev          # http://localhost:5173
+npm run build        # production bundle in frontend/dist/
 ```
 
-No `pytest` suite exists yet — `tests/` currently holds the Day 3 manual curl procedure in `tests/manual_day3.md` (Day 5 will add `tests/unit/`, `tests/integration/`, `tests/evals/`).
+Manual end-to-end smoke procedures live in `tests/manual_day3.md` (curl) and `tests/manual_day4.md` (frontend). No `pytest` suite exists yet — Day 5 will add `tests/unit/`, `tests/integration/`, `tests/evals/`.
 
 ## Environment
 
@@ -101,8 +107,23 @@ To create a fresh schema: `alembic upgrade head`. To teardown: `alembic downgrad
 
 ## Day-by-day deliverables (from PRD §11, for context)
 
-Days 1–3 are done (graph, judge, API/DB/observability). Remaining:
-- **Day 4** React frontend (`SessionSidebar`, `RoundCard`, `JudgeScorecard`, `VerdictBanner`, delete flow).
+Days 1–3 are done (graph, judge, API/DB/observability). Day 4 is in progress (frontend scaffolding in `frontend/`, smoke test in `tests/manual_day4.md`). Remaining:
+- **Day 4** React frontend — wire `SessionSidebar`, `RoundCard`, `JudgeScorecard`, `VerdictBanner`, delete flow to the Day 3 API.
 - **Day 5** pytest unit + integration suite with mocked LLMs.
 - **Day 6** Eval suite (judge consistency, position-bias, schema compliance, argument quality) → `eval_results.csv`.
 - **Day 7** Multi-stage Dockerfile (builder + runtime, non-root), Railway/Render deploy, Vercel frontend, demo video.
+
+## Progress Tracking
+Maintain PROGRESS.md at the project root continuously while working on any 
+sprint day:
+- Update it after completing each meaningful sub-task (not after every 
+  single file edit — after a logical unit of work, like "one test file 
+  written and passing")
+- Structure: DONE / IN PROGRESS / NOT STARTED, matching the current 
+  sprint day's deliverables from docs/PRD.md Section 11
+- Before starting a new sub-task, mark the previous one DONE and the new 
+  one IN PROGRESS with a one-line note on what's next
+- If a task fails or gets interrupted mid-way, note exactly where it 
+  stopped and why, so work can resume without re-diagnosing from scratch
+- Never let PROGRESS.md go stale for more than one sub-task at a time — 
+  it should always reflect the true current state, not the plan

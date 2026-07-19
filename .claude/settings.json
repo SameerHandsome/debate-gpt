@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [[ \"$CLAUDE_TOOL_INPUT_FILE_PATH\" == *.py ]]; then venv/Scripts/python.exe -m py_compile \"$CLAUDE_TOOL_INPUT_FILE_PATH\" && venv/Scripts/python.exe -m pyflakes \"$CLAUDE_TOOL_INPUT_FILE_PATH\"; fi",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -d tests ]; then venv/Scripts/python.exe -m pytest --tb=short -q; fi",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}
