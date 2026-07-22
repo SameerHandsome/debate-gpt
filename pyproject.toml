@@ -15,3 +15,20 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "debate_gpt" = ["py.typed"]
+
+[tool.pytest.ini_options]
+# Day 5: unit + integration tests. Eval suite is Day 6 (real LLM calls)
+# and is not collected by default.
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+asyncio_mode = "auto"
+markers = [
+    "integration: integration tests that exercise the FastAPI app (deselect with -m 'not integration')",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:langchain.*",
+]

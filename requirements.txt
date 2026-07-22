@@ -13,3 +13,9 @@ asyncpg>=0.29,<0.31
 loguru>=0.7,<0.8
 alembic>=1.13,<2
 psycopg2-binary>=2.9,<3   # alembic migrations (sync driver, used only at upgrade time)
+
+# Day 5 — pytest suite
+pytest>=8,<9
+pytest-asyncio>=0.23,<1
+pytest-cov>=5,<7
+pytest-mock>=3.14,<4
